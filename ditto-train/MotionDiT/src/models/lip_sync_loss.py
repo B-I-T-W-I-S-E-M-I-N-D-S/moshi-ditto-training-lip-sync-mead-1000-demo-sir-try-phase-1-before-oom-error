@@ -330,25 +330,43 @@ class LipSyncLoss(nn.Module):
     # Rendering helpers
     # -----------------------------------------------------------------------
 
-    def render_frames(self, pred_motion_window, kp_canonical, f_s, x_s):
+    def render_frames(self, pred_motion_window, kp_canonical, f_s, x_s,
+                      grad_start: int = 0, grad_end: int = -1):
         """
         Render multiple frames from predicted motion parameters.
+
+        Memory-efficient: only frames in [grad_start, grad_end) are rendered
+        with gradients. All others use torch.no_grad() to avoid storing
+        activations, dramatically reducing peak VRAM usage on small GPUs.
 
         Args:
             pred_motion_window: (B, T, 265)
             kp_canonical:       (B, 63)
             f_s:                (B, 32, 16, 64, 64)
             x_s:                (B, 21, 3)
+            grad_start:         first frame index that needs gradients (inclusive)
+            grad_end:           last frame index that needs gradients (exclusive)
+                                -1 means ALL frames get gradients (legacy mode)
 
         Returns:
             rendered_frames: (B, T, 3, H, W)
         """
         B, T, _ = pred_motion_window.shape
+        if grad_end < 0:
+            grad_end = T  # legacy: all frames
+
         rendered_list = []
         for t in range(T):
-            motion_t = pred_motion_window[:, t, :]
-            x_d      = motion_vec_to_keypoints(motion_t, kp_canonical)
-            frame    = self.renderer(f_s, x_s, x_d)
+            need_grad = (grad_start <= t < grad_end)
+            if need_grad:
+                motion_t = pred_motion_window[:, t, :]
+                x_d      = motion_vec_to_keypoints(motion_t, kp_canonical)
+                frame    = self.renderer(f_s, x_s, x_d)
+            else:
+                with torch.no_grad():
+                    motion_t = pred_motion_window[:, t, :].detach()
+                    x_d      = motion_vec_to_keypoints(motion_t, kp_canonical)
+                    frame    = self.renderer(f_s, x_s, x_d)
             rendered_list.append(frame)
         return torch.stack(rendered_list, dim=1)  # (B, T, 3, H, W)
 
@@ -501,17 +519,19 @@ class LipSyncLoss(nn.Module):
             else:
                 pred_motion_window = pred_motion_window[:, :T_ext, :]
 
-        # 1. Render FULL extended window (T + 2*max_shift frames) in one pass
+        # SyncNet gradient window position within T_ext
+        # Only these SF=5 frames need gradients — everything else is no_grad
+        z_start = self.max_shift + self.center_offset
+        z_end   = z_start + SF
+
+        # 1. Memory-efficient render: gradients ONLY for the 5-frame SyncNet window
         with torch.cuda.amp.autocast(enabled=True):
             rendered_ext = self.render_frames(
-                pred_motion_window, kp_canonical, f_s, x_s
+                pred_motion_window, kp_canonical, f_s, x_s,
+                grad_start=z_start, grad_end=z_end,   # ← only 5 frames need grad
             )  # (B, T_ext, 3, H, W)
 
-        # 2. Zero-shift: pick the centered 5-frame SyncNet sub-window (differentiable)
-        #    In the extended window, the zero-shift render starts at max_shift.
-        #    Within that T-frame render, the SyncNet window is at center_offset.
-        z_start       = self.max_shift + self.center_offset
-        z_end         = z_start + SF                   # always SF=5 frames
+        # 2. Slice the 5-frame SyncNet window (already has gradients)
         rendered_sync = rendered_ext[:, z_start:z_end, :, :, :]  # (B, 5, 3, H, W)
 
         if debug:
